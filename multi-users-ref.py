@@ -46,6 +46,37 @@ def get_supabase_anon_key() -> str:
     return (os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
 
 
+def _iter_secret_values(obj) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, (dict, list, tuple)):
+                pairs.extend(_iter_secret_values(v))
+            elif v is not None:
+                pairs.append((str(k), str(v)))
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            if isinstance(v, (dict, list, tuple)):
+                pairs.extend(_iter_secret_values(v))
+    return pairs
+
+
+def _pick_from_secrets(candidates: tuple[str, ...]) -> str:
+    try:
+        secrets_obj = st.secrets.to_dict()
+    except Exception:
+        try:
+            secrets_obj = dict(st.secrets)
+        except Exception:
+            return ""
+    pairs = _iter_secret_values(secrets_obj)
+    candidate_set = {c.lower() for c in candidates}
+    for k, v in pairs:
+        if k.lower() in candidate_set and v.strip():
+            return v.strip()
+    return ""
+
+
 def _load_dotenv_like_file(path: Path, keys: set[str]) -> None:
     if not path.exists() or not path.is_file():
         return
@@ -66,6 +97,36 @@ def _load_dotenv_like_file(path: Path, keys: set[str]) -> None:
             os.environ[k] = v
 
 
+def load_streamlit_secrets_to_env() -> None:
+    """
+    Streamlit Cloud에서는 Secrets가 st.secrets로 주입됩니다.
+    기존 코드(os.getenv 사용)를 유지하기 위해 필요한 키를 환경변수로 동기화합니다.
+    """
+    if not os.getenv("SUPABASE_URL"):
+        v = _pick_from_secrets(("SUPABASE_URL", "supabase_url", "url"))
+        if v:
+            os.environ["SUPABASE_URL"] = v
+    if not os.getenv("SUPABASE_ANON_KEY"):
+        v = _pick_from_secrets(
+            (
+                "SUPABASE_ANON_KEY",
+                "supabase_anon_key",
+                "SUPABASE_KEY",
+                "supabase_key",
+                "ANON_KEY",
+                "anon_key",
+            )
+        )
+        if v:
+            os.environ["SUPABASE_ANON_KEY"] = v
+    if not os.getenv("SUPABASE_SERVICE_ROLE_KEY"):
+        v = _pick_from_secrets(
+            ("SUPABASE_SERVICE_ROLE_KEY", "supabase_service_role_key", "SERVICE_ROLE_KEY", "service_role_key")
+        )
+        if v:
+            os.environ["SUPABASE_SERVICE_ROLE_KEY"] = v
+
+
 def load_local_supabase_env_fallback() -> None:
     needed = {"SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_ROLE_KEY"}
     if os.getenv("SUPABASE_URL") and (os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")):
@@ -75,6 +136,7 @@ def load_local_supabase_env_fallback() -> None:
 
 
 def create_supabase_client() -> Client:
+    load_streamlit_secrets_to_env()
     load_local_supabase_env_fallback()
     url = (os.getenv("SUPABASE_URL") or "").strip()
     key = get_supabase_anon_key()
@@ -541,10 +603,30 @@ def init_state() -> None:
     for k in ("api_openai", "api_anthropic", "api_google"):
         if k not in st.session_state:
             st.session_state[k] = ""
+    if "supabase_url_input" not in st.session_state:
+        st.session_state.supabase_url_input = os.getenv("SUPABASE_URL", "")
+    if "supabase_key_input" not in st.session_state:
+        st.session_state.supabase_key_input = (
+            os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY") or ""
+        )
 
 
 def label_for_session(row: dict[str, Any]) -> str:
     return f"{row['title']} ({str(row['id'])[:8]})"
+
+
+def render_supabase_connection_inputs() -> None:
+    st.markdown("### Supabase 연결")
+    st.caption("Cloud Secrets가 안 읽힐 때를 대비한 수동 입력입니다.")
+    st.text_input("SUPABASE_URL", key="supabase_url_input")
+    st.text_input("SUPABASE_ANON_KEY / SERVICE_ROLE_KEY", type="password", key="supabase_key_input")
+
+    url = (st.session_state.get("supabase_url_input") or "").strip()
+    key = (st.session_state.get("supabase_key_input") or "").strip()
+    if url and not os.getenv("SUPABASE_URL"):
+        os.environ["SUPABASE_URL"] = url
+    if key and not (os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")):
+        os.environ["SUPABASE_ANON_KEY"] = key
 
 
 def render_api_key_inputs() -> None:
@@ -634,14 +716,19 @@ def main() -> None:
     init_state()
     inject_styles()
 
+    with st.sidebar:
+        render_supabase_connection_inputs()
+
     try:
         sb = create_supabase_client()
         restore_supabase_session(sb)
     except Exception as e:
         st.error(str(e))
+        st.info("Secrets가 반영되지 않으면 사이드바의 Supabase 연결 입력칸에 URL/KEY를 직접 넣어주세요.")
         return
 
     with st.sidebar:
+        st.divider()
         render_api_key_inputs()
         apply_api_keys_to_environ()
         render_auth_sidebar(sb)
